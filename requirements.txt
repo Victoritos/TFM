@@ -1,0 +1,12 @@
+gymnasium>=1.0.0
+stable-baselines3[extra]>=2.3.0
+sb3-contrib>=2.3.0
+optuna>=4.0.0
+matplotlib>=3.7.0
+seaborn>=0.13.0
+pandas>=2.0.0
+numpy>=1.24.0
+swig
+gymnasium[box2d]
+gymnasium[other]
+#torch>=2.3.0 # Si usas CUDA, instala la versión específica desde https://pytorch.org/get-started/locally/
