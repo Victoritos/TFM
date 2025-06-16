@@ -4,14 +4,17 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import gymnasium as gym
+import torch
 
 # --- Importaciones de Stable Baselines 3 ---
 from stable_baselines3 import PPO, SAC, TD3, DDPG
 from sb3_contrib import TRPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
+from stable_baselines3.common.vec_env import VecTransposeImage
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.noise import NormalActionNoise
+from stable_baselines3.common.vec_env import VecTransposeImage, SubprocVecEnv, DummyVecEnv
+from stable_baselines3.common.evaluation import evaluate_policy
 
 # --- Importaciones para la lectura de logs ---
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
@@ -20,6 +23,13 @@ import glob
 # --- Configuración de estilo para las gráficas ---
 sns.set_theme(style="whitegrid", palette="husl")
 COLORS = sns.color_palette("husl", 5)
+
+# Configuración de hilos de PyTorch
+torch.set_num_threads(4)
+torch.set_num_interop_threads(4)
+
+# Evitar el conflicto de múltiples runtimes de OpenMP
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 class RLExperimentManager:
     """
@@ -31,150 +41,166 @@ class RLExperimentManager:
     - Pruebas de robustez.
     - Análisis de resultados como los tiempos de entrenamiento.
     """
-    def __init__(self, experiment_name="TFM_RL"):
-        """
-        Inicializa el gestor de experimentos.
-        
-        Args:
-            experiment_name (str): Nombre base para el directorio de experimentos.
-        """
+    def __init__(self, experiment_name="TFM_RL", n_envs=8, n_eval_envs=4):
         self.experiment_name = experiment_name
+        self.n_envs = n_envs
+        self.n_eval_envs = n_eval_envs
         self.base_dir = f"experiments/{experiment_name}"
-        self.algorithms = {
-            'PPO': PPO,
-            'SAC': SAC,
-            'TD3': TD3,
-            'DDPG': DDPG,
-            'TRPO': TRPO
-        }
+        self.algorithms = {'PPO': PPO, 'SAC': SAC, 'TD3': TD3, 'DDPG': DDPG, 'TRPO': TRPO}
         self._setup_directories()
-        print(f"✅ Gestor de experimentos '{experiment_name}' inicializado. Los resultados se guardarán en '{self.base_dir}'")
+        print(f"✅ Gestor de experimentos '{experiment_name}' inicializado en GPU con {n_envs} entornos paralelos.")
 
     def _setup_directories(self):
-        """Crea los subdirectorios necesarios para guardar los resultados del experimento."""
-        print("🛠️  Configurando directorios...")
         dirs = ['models', 'videos', 'plots', 'results', 'logs']
         for d in dirs:
             os.makedirs(f"{self.base_dir}/{d}", exist_ok=True)
-            os.makedirs(f"{self.base_dir}/plots/training_times", exist_ok=True) # Directorio específico para tiempos
+        os.makedirs(f"{self.base_dir}/plots/training_times", exist_ok=True)
 
-    def create_env(self, env_name, seed=0):
-        """
-        Crea y envuelve un entorno de Gymnasium.
-        
-        Args:
-            env_name (str): Nombre del entorno.
-            seed (int): Semilla para la reproducibilidad.
+    def create_vec_env(self, env_name, seed=0, n_envs=None, eval=False):
+        n = n_envs or (self.n_eval_envs if eval else self.n_envs)
+        def make_env(rank):
+            def _init():
+                env = gym.make(env_name)
+                # Solo en el env principal mantenemos Monitor
+                env = Monitor(env) if rank == 0 else env
+                env.reset(seed=seed + rank)
+                return env
+            return _init
 
-        Returns:
-            DummyVecEnv: El entorno vectorizado y listo para usar.
-        """
-        def make_env():
-            env = gym.make(env_name)
-            env = Monitor(env) # Monitor para registrar estadísticas como la recompensa
-            env.reset(seed=seed)
-            return env
-        env = DummyVecEnv([make_env])
-        # CarRacing necesita un manejo especial de las observaciones (imágenes)
+        envs = [make_env(i) for i in range(n)]
+        vec_env = SubprocVecEnv(envs)
         if "CarRacing" in env_name:
-            env = VecTransposeImage(env)
-        return env
+            vec_env = VecTransposeImage(vec_env)
+        return vec_env
 
-    def train_agent(self, env_name, algo_name, total_timesteps=100_000, seed=0):
-        """
-        Entrena un agente usando un algoritmo específico en un entorno dado.
-        
-        Args:
-            env_name (str): Nombre del entorno.
-            algo_name (str): Nombre del algoritmo (ej. 'PPO').
-            total_timesteps (int): Número de pasos de tiempo para el entrenamiento.
-            seed (int): Semilla para la reproducibilidad.
-        """
-        print(f"\n🚀 === Iniciando entrenamiento: {algo_name} en {env_name} por {total_timesteps} timesteps === 🚀")
-        # Crear entornos de entrenamiento y evaluación
-        env = self.create_env(env_name, seed=seed)
-        eval_env = self.create_env(env_name, seed=seed+42)
 
-        # Seleccionar la política y el dispositivo adecuados
+    def train_agent(self, env_name, algo_name, total_timesteps=1_000_000, seed=0):
+        print(f"\n🚀 Entrenando {algo_name} en {env_name} por {total_timesteps} timesteps con {self.n_envs} envs paralelos")
+        env = self.create_vec_env(env_name, seed)
+
+        # Política y dispositivo
         policy = "CnnPolicy" if "CarRacing" in env_name else "MlpPolicy"
-        device = "cuda" if "CarRacing" in env_name else "cpu"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"🧠 Política: {policy} | 🔌 Dispositivo: {device}")
 
-        # Argumentos comunes para todos los modelos
-        common_kwargs = dict(
+        # Parámetros base SIN TensorBoard logging para máxima velocidad
+        base_kwargs = dict(
             policy=policy,
             env=env,
-            verbose=0, # Reducido a 0 para no saturar la consola, los logs de TB son suficientes
-            tensorboard_log=f"{self.base_dir}/logs/{env_name}_{algo_name}",
+            verbose=0,
             seed=seed,
-            device=device
+            device=device,
         )
 
-        """
-        # Argumentos específicos para algoritmos off-policy
-        if algo_name in ["SAC", "TD3", "DDPG"]:
-            common_kwargs["buffer_size"] = 200_000
+        n_steps_env = min(256, max(1, total_timesteps // self.n_envs))
+        if algo_name == "PPO":
+            algo_kwargs = dict(
+                **base_kwargs,
+                n_steps=n_steps_env,               # pasos por entorno
+                batch_size=64 * self.n_envs,
+                n_epochs=10,
+            )
+        elif algo_name == "TRPO":
+            algo_kwargs = dict(
+                **base_kwargs,
+                n_steps=n_steps_env,               # igual en TRPO
+            )
+        else:
+            # Off-policy
             n_actions = env.action_space.shape[-1]
-            action_noise = NormalActionNoise(mean=np.zeros(n_actions), sigma=0.1 * np.ones(n_actions))
-            common_kwargs["action_noise"] = action_noise
-        """
+            action_noise = None
+            if algo_name in ["TD3", "DDPG"]:
+                action_noise = NormalActionNoise(mean=np.zeros(n_actions), sigma=0.1 * np.ones(n_actions))
 
-        # Instanciar el modelo
-        model_class = self.algorithms[algo_name]
-        model = model_class(**common_kwargs)
+            algo_kwargs = dict(
+                **base_kwargs,
+                buffer_size=200_000,
+                batch_size=256,
+                learning_starts=1_000,
+                train_freq=1,
+                gradient_steps=1,
+            )
+            if action_noise is not None:
+                algo_kwargs["action_noise"] = action_noise
 
-        # Callback para guardar el mejor modelo durante la evaluación
-        eval_callback = EvalCallback(
-            eval_env,
-            best_model_save_path=f"{self.base_dir}/models/{env_name}_{algo_name}",
-            log_path=f"{self.base_dir}/results/{env_name}_{algo_name}",
-            eval_freq=max(5000, total_timesteps // 20), # Evaluar más a menudo en entrenamientos cortos
-            n_eval_episodes=10,
-            deterministic=True,
-            render=False
+        model = self.algorithms[algo_name](**algo_kwargs)
+
+        # Entrenamiento puro sin callbacks
+        model.learn(total_timesteps=total_timesteps, progress_bar=True)
+
+        # Cerrar entorno paralelo
+        env.close()
+
+        # Guardar modelo final
+        final_path = f"{self.base_dir}/models/{env_name}_{algo_name}_final"
+        model.save(final_path)
+        print(f"✅ Modelo final guardado en: {final_path}.zip")
+
+        # Evaluación final manual de n_eval_envs episodios
+        results_dir = os.path.join(self.base_dir, "results", f"{env_name}_{algo_name}")
+        os.makedirs(results_dir, exist_ok=True)
+
+        eval_env_clean = Monitor(gym.make(env_name))
+        rewards = []
+        for _ in range(self.n_eval_envs):
+            obs, _ = eval_env_clean.reset()
+            done = False
+            total_r = 0.0
+            while not done:
+                action, _ = model.predict(obs, deterministic=True)
+                obs, reward, terminated, truncated, _ = eval_env_clean.step(action)
+                total_r += reward
+                done = terminated or truncated
+            rewards.append(total_r)
+        eval_env_clean.close()
+
+        mean_reward = float(np.mean(rewards))
+        std_reward = float(np.std(rewards))
+        np.savez(
+            os.path.join(results_dir, "evaluations.npz"),
+            timesteps=np.array([total_timesteps]),
+            results=np.array([[mean_reward]]),
+            stds=np.array([[std_reward]])
         )
+        print(f"   💾 Evaluación final guardada en: {results_dir}/evaluations.npz  (mean={mean_reward:.2f} ±{std_reward:.2f})")
 
-        # Iniciar el entrenamiento
-        model.learn(total_timesteps=total_timesteps, callback=eval_callback, progress_bar=True)
-        
-        # Guardar el modelo final
-        final_model_path = f"{self.base_dir}/models/{env_name}_{algo_name}_final"
-        model.save(final_model_path)
-        print(f"✅ Entrenamiento completado. Modelo final guardado en: {final_model_path}.zip")
+        # Liberar GPU
+        del model
+        torch.cuda.empty_cache()
 
     def plot_learning_curve(self, env_name, algo_names):
-        """
-        Genera y guarda una gráfica comparando las curvas de aprendizaje de varios algoritmos.
-        
-        Args:
-            env_name (str): Nombre del entorno.
-            algo_names (list): Lista de nombres de algoritmos a comparar.
-        """
         print(f"\n📊 Generando curva de aprendizaje para {env_name}...")
         plt.figure(figsize=(12, 7))
+
         for idx, algo_name in enumerate(algo_names):
-            log_path = f"{self.base_dir}/results/{env_name}_{algo_name}/evaluations.npz"
-            if not os.path.exists(log_path):
+            results_path = os.path.join(
+                self.base_dir, "results", f"{env_name}_{algo_name}", "evaluations.npz"
+            )
+            if not os.path.exists(results_path):
                 print(f"   - Aviso: No se encontró el archivo de evaluación para {algo_name}. Se omitirá.")
                 continue
-            
-            data = np.load(log_path)
+            data = np.load(results_path)
             timesteps = data['timesteps']
             results = data['results']
             mean_rewards = np.mean(results, axis=1)
             std_rewards = np.std(results, axis=1)
-            
+
             plt.plot(timesteps, mean_rewards, label=algo_name, color=COLORS[idx])
-            plt.fill_between(timesteps, mean_rewards-std_rewards, mean_rewards+std_rewards, alpha=0.2, color=COLORS[idx])
-            
+            plt.fill_between(
+                timesteps,
+                mean_rewards - std_rewards,
+                mean_rewards + std_rewards,
+                alpha=0.2,
+                color=COLORS[idx]
+            )
+
         plt.title(f"Curva de Aprendizaje en {env_name}")
         plt.xlabel("Timesteps")
         plt.ylabel("Recompensa Media de Evaluación (±std)")
         plt.legend()
         plt.grid(True, which='both', linestyle='--', linewidth=0.5)
         plt.tight_layout()
-        
-        save_path = f"{self.base_dir}/plots/{env_name}_learning_curve.png"
+        save_path = os.path.join(self.base_dir, "plots", f"{env_name}_learning_curve.png")
         plt.savefig(save_path, dpi=300)
         plt.close()
         print(f"   💾 Gráfica guardada en: {save_path}")
@@ -290,7 +316,7 @@ class RLExperimentManager:
         df = pd.DataFrame(training_times).reindex(index=algos, columns=envs)
         
         # Convertir todos los tiempos a minutos y formatear
-        df_minutes = df.applymap(lambda x: x / 60 if pd.notna(x) else np.nan)
+        df_minutes = df.map(lambda x: x / 60 if pd.notna(x) else np.nan)
         
         # Guardar como CSV
         csv_path = os.path.join(output_dir, "summary_training_times.csv")
@@ -312,36 +338,55 @@ class RLExperimentManager:
 
 
     def robustness_test(self, env_name, algo_name, noise_levels=[0.0, 0.1, 0.2], episodes=20):
+        #Prueba la robustez añadiendo ruido gaussiano guardando medias y desviaciones.
         model_path = f"{self.base_dir}/models/{env_name}_{algo_name}_final.zip"
         if not os.path.exists(model_path):
-            print(f"Modelo {model_path} no encontrado.")
+            print(f"Modelo {model_path} no encontrado. Se omite robustez.")
             return
-        model = self.algorithms[algo_name].load(model_path)
+
+        # 1) Cargo el modelo en CPU para liberar GPU
+        model = self.algorithms[algo_name].load(model_path, device="cpu")
+
+        # 2) Entorno sencillo
         env = gym.make(env_name)
-        rewards = []
+        summary = []
+        print(f"🔍 Robustez: {algo_name} en {env_name}")
+
         for noise in noise_levels:
-            rewards_noise = []
-            for _ in range(episodes):
+            rews = []
+            for ep in range(episodes):
                 obs, _ = env.reset()
-                total_reward = 0
-                terminated, truncated = False, False
-                while not (terminated or truncated):
-                    noisy_obs = obs + np.random.normal(0, noise, size=np.shape(obs))
+                done = False
+                total_r = 0.0
+                while not done:
+                    noisy_obs = obs + np.random.normal(0, noise, size=obs.shape)
                     action, _ = model.predict(noisy_obs, deterministic=True)
-                    obs, reward, terminated, truncated, _ = env.step(action)
-                    total_reward += reward
-                rewards_noise.append(total_reward)
-            rewards.append((noise, np.mean(rewards_noise), np.std(rewards_noise)))
-        # Plot
-        df = pd.DataFrame(rewards, columns=["noise", "mean_reward", "std_reward"])
-        plt.figure(figsize=(8, 5))
-        plt.errorbar(df["noise"], df["mean_reward"], yerr=df["std_reward"], fmt="r--o")
+                    obs, r, terminated, truncated, _ = env.step(action)
+                    total_r += r
+                    done = terminated or truncated
+                rews.append(total_r)
+                if (ep+1) % max(1, episodes//5) == 0:
+                    print(f"  ruido={noise:.2f} ep {ep+1}/{episodes}: r={total_r:.1f}")
+            m, s = np.mean(rews), np.std(rews)
+            summary.append((noise, m, s))
+            print(f" • ruido={noise:.2f}: media={m:.1f} ±{s:.1f}")
+
+        # 3) Gráfica
+        df = pd.DataFrame(summary, columns=["noise", "mean_reward", "std_reward"])
+        plt.figure(figsize=(8,5))
+        plt.errorbar(df["noise"], df["mean_reward"], yerr=df["std_reward"], fmt="o-")
         plt.title(f"Robustez de {algo_name} en {env_name}")
-        plt.xlabel("Nivel de ruido gaussiano")
+        plt.xlabel("Ruido gaussiano σ")
         plt.ylabel("Recompensa media")
-        plt.tight_layout()
-        plt.savefig(f"{self.base_dir}/plots/{env_name}_{algo_name}_robustness.png", dpi=300)
-        plt.close()
+        plt.grid(True, linestyle="--", linewidth=0.5)
+        out = f"{self.base_dir}/plots/{env_name}_{algo_name}_robustness.png"
+        plt.savefig(out, dpi=300); plt.close()
+        print(f"   ✅ Guardado robustez en: {out}")
+
+        # 4) Limpieza
+        env.close()
+        del model
+        torch.cuda.empty_cache()
 
 
 # -------------------- USO DEL SISTEMA --------------------
@@ -350,21 +395,21 @@ if __name__ == "__main__":
     
     # --- Definición de Entornos y Algoritmos ---
     envs = [
-        "Pendulum-v1",
-        "MountainCarContinuous-v0",
-        "LunarLanderContinuous-v3",
-        #"CarRacing-v3",
+        #"Pendulum-v1",
+        #"MountainCarContinuous-v0",
+        #"LunarLanderContinuous-v3",
+        "CarRacing-v3",
         #"BipedalWalker-v3"
     ]
     algos = ["PPO", "SAC", "TD3", "DDPG", "TRPO"]
     
     # --- Configuración de Timesteps por Entorno ---
     timesteps_per_env = {
-        "Pendulum-v1": 100_000,
-        "MountainCarContinuous-v0": 100_000,
-        "LunarLanderContinuous-v3": 500_000,
-        "CarRacing-v3": 3_000_000,
-        "BipedalWalker-v3": 3_000_000,
+        #"Pendulum-v1": 100_000,
+        # "MountainCarContinuous-v0": 100_000,
+        # "LunarLanderContinuous-v3": 500_000,
+         "CarRacing-v3": 1_000,
+        #"BipedalWalker-v3": 3_000_000,
     }
 
     # --- SECCIÓN DE ENTRENAMIENTO (Comentada para ejecutar solo el análisis) ---
@@ -372,9 +417,8 @@ if __name__ == "__main__":
     
     print("\n\n--- INICIANDO FASE DE ENTRENAMIENTO COMPLETA ---")
     for env_name in envs:
-        total_timesteps = timesteps_per_env[env_name]
         for algo_name in algos:
-            experiment.train_agent(env_name, algo_name, total_timesteps=total_timesteps, seed=0)
+            experiment.train_agent(env_name, algo_name, total_timesteps=timesteps_per_env[env_name], seed=0)
             experiment.record_agent_video(env_name, algo_name)
         experiment.plot_learning_curve(env_name, algos)
     print("\n--- ✅ FASE DE ENTRENAMIENTO FINALIZADA ---")
@@ -384,10 +428,9 @@ if __name__ == "__main__":
     print("\n\n--- INICIANDO FASE DE ANÁLISIS DE RESULTADOS ---")
     
     # 1. Obtener y guardar tiempos de entrenamiento
+
     training_times = experiment.get_training_times_from_logs(envs, algos)
     experiment.save_training_times(training_times)
-    
-    # 2. Guardar la tabla resumen
     experiment.save_summary_table(training_times, envs, algos)
     
     print("\n\n--- ✅ Proceso de análisis completado con éxito. ---")
@@ -397,8 +440,7 @@ if __name__ == "__main__":
     
     print("\n\n--- INICIANDO FASE DE ANÁLISIS DE ROBUSTEZ ---")
     for env_name in envs:
-            for algo_name in algos:
-                experiment.robustness_test(env_name, algo_name, noise_levels=[0.0, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5], episodes=10)
-    
+        for algo_name in algos:
+            experiment.robustness_test(env_name, algo_name, noise_levels=[0.2, 0.5], episodes=2) 
     print("\n\n--- ✅ Proceso de análisis de robustez completado con éxito. ---")
     
