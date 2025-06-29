@@ -75,10 +75,6 @@ Los experimentos se han realizado en cinco entornos continuos de la librería [G
 - gymnasium
 - torch / tensorflow
 - numpy, pandas, matplotlib, seaborn, plotly
-
-Instalación de dependencias:
-pip install -r requirements.txt
-
 ---
 
 ## Instrucciones de uso
